@@ -1,0 +1,13 @@
+{
+  "name": "finance-trading-web",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "start": "echo \"Initialize Angular app first: npx @angular/cli@latest new web --directory . --routing --style=scss\"",
+    "build": "echo \"Angular app not initialized yet\""
+  },
+  "dependencies": {
+    "gridstack": "^11.3.0",
+    "rxjs": "^7.8.1"
+  }
+}

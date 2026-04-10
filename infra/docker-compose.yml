@@ -1,0 +1,74 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: fta-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-trading_app}
+      POSTGRES_USER: ${POSTGRES_USER:-trading_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trading_pass}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ../data/postgres/init:/docker-entrypoint-initdb.d
+
+  redis:
+    image: redis:7
+    container_name: fta-redis
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio:latest
+    container_name: fta-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minio123}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  api:
+    build:
+      context: ..
+      dockerfile: infra/docker/api.Dockerfile
+    container_name: fta-api
+    env_file:
+      - ../.env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+
+  workers:
+    build:
+      context: ..
+      dockerfile: infra/docker/api.Dockerfile
+    container_name: fta-workers
+    env_file:
+      - ../.env
+    command: ["python", "-m", "jobs.daily_refresh"]
+    working_dir: /app/apps/workers
+    depends_on:
+      - postgres
+      - redis
+
+  trading:
+    build:
+      context: ..
+      dockerfile: infra/docker/trading.Dockerfile
+    container_name: fta-trading
+    env_file:
+      - ../.env
+    depends_on:
+      - redis
+
+volumes:
+  pg_data:
+  minio_data:

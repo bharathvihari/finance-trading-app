@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DashboardLayout",
+  "type": "object",
+  "required": ["userId", "dashboardId", "widgets"],
+  "properties": {
+    "userId": { "type": "string" },
+    "dashboardId": { "type": "string" },
+    "name": { "type": "string" },
+    "widgets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["widgetId", "type", "x", "y", "w", "h", "params"],
+        "properties": {
+          "widgetId": { "type": "string" },
+          "type": { "type": "string" },
+          "x": { "type": "integer", "minimum": 0 },
+          "y": { "type": "integer", "minimum": 0 },
+          "w": { "type": "integer", "minimum": 1 },
+          "h": { "type": "integer", "minimum": 1 },
+          "params": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,4 @@
+nautilus_trader==1.220.0
+pandas==2.3.2
+pyyaml==6.0.2
+python-dotenv==1.1.1

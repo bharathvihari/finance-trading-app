@@ -1,0 +1,48 @@
+job_name: historical_backfill
+mode: backfill
+dry_run: false
+
+frequency:
+  name: daily
+  ibkr_bar_size: "1 day"
+
+storage:
+  parquet_root: data/parquet/price-data
+  duckdb_path: data/duckdb/market_data.duckdb
+
+ibkr:
+  host: 127.0.0.1
+  port: 7497
+  client_id: 1001
+  account:
+  gateway_mode: paper
+  connect_timeout_seconds: 10.0
+  fallback_enabled: true
+  what_to_show: TRADES
+  use_regular_trading_hours: true
+  timezone: UTC
+
+rate_limits:
+  max_requests_per_window: 60
+  window_seconds: 600
+  identical_request_cooldown_seconds: 15
+  utilization_target_pct: 65
+  base_delay_seconds: 0.8
+  jitter_seconds: 0.6
+  max_retries: 3
+  backoff_base_seconds: 1.0
+  max_backoff_seconds: 30.0
+  backoff_jitter_seconds: 0.5
+
+universe:
+  exchanges:
+    NASDAQ:
+      priority_symbols: [AAPL, MSFT, NVDA]
+      priority_indices: [NDX]
+      symbols: [AMZN, META, TSLA]
+      indices: []
+    NYSE:
+      priority_symbols: [BRK.B, JPM]
+      priority_indices: [DJI]
+      symbols: [V, KO]
+      indices: [SPX]

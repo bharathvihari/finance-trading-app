@@ -1,0 +1,9 @@
+psycopg2-binary==2.9.10
+pandas==2.3.2
+pyarrow==21.0.0
+python-dotenv==1.1.1
+schedule==1.2.2
+duckdb==1.4.0
+PyYAML==6.0.2
+pydantic==2.11.9
+nautilus_trader==1.220.0
