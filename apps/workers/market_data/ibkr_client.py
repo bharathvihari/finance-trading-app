@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import os
 import socket
+import ssl
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
+from urllib import parse, request
+from urllib.error import HTTPError, URLError
 
 from .config import IbkrConfig, RateLimitConfig
 from .models import Instrument
@@ -65,15 +69,23 @@ class HistoricalBackend(Protocol):
 
 
 class NautilusIbkrBackend:
-    """Nautilus-backed backend with version-tolerant dynamic loading.
+    """IBKR Client Portal backend with Nautilus runtime validation.
 
-    This intentionally avoids hard-coding unstable Nautilus APIs. It verifies
-    availability at runtime and can be switched to concrete methods later.
+    This backend uses Client Portal Gateway HTTP endpoints for symbol resolution
+    and historical bars while still validating that NautilusTrader exists in
+    the environment per project runtime expectations.
     """
 
-    def __init__(self, runtime: IbkrRuntimeConfig):
+    _MAX_HEAD_PAGES = 12
+    _HEAD_PAGE_PERIOD = "5y"
+
+    def __init__(self, runtime: IbkrRuntimeConfig, logger: logging.Logger | None = None):
         self.runtime = runtime
+        self.logger = logger or logging.getLogger(__name__)
         self._nautilus_module = None
+        self._conid_cache: dict[tuple[str, str, str], str] = {}
+        self._ssl_context = ssl._create_unverified_context()
+        self._base_url = self._build_base_url()
         self._bootstrap_runtime()
 
     def _bootstrap_runtime(self) -> None:
@@ -97,9 +109,50 @@ class NautilusIbkrBackend:
                 pass
         except OSError as exc:
             raise IbkrConnectionError(
-                f"Unable to reach IBKR gateway at {self.runtime.host}:{self.runtime.port}. "
-                "Start IBKR Gateway/TWS or enable fallback mode."
+                f"Unable to reach IBKR endpoint at {self.runtime.host}:{self.runtime.port}. "
+                "Start Client Portal Gateway and ensure the configured host/port are correct."
             ) from exc
+
+        self._ensure_authenticated()
+
+    def _build_base_url(self) -> str:
+        host = self.runtime.host.strip()
+        if host.startswith("http://") or host.startswith("https://"):
+            parsed = parse.urlsplit(host)
+            if parsed.netloc and parsed.port is not None:
+                return host.rstrip("/")
+            if parsed.netloc:
+                netloc = parsed.netloc if self.runtime.port == 0 else f"{parsed.netloc}:{self.runtime.port}"
+                return parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", "")).rstrip("/")
+            return host.rstrip("/")
+
+        scheme = "https" if self.runtime.port in (5000, 5001) else "http"
+        return f"{scheme}://{host}:{self.runtime.port}"
+
+    def _ensure_authenticated(self) -> None:
+        try:
+            payload = self._request_json("GET", "/v1/api/iserver/auth/status")
+        except IbkrUpstreamError as exc:
+            if "HTTP 401" in str(exc):
+                raise IbkrConnectionError(
+                    "Client Portal Gateway returned 401 Unauthorized. "
+                    "Open the gateway web session and complete IBKR login first."
+                ) from exc
+            raise
+        if not isinstance(payload, dict):
+            raise IbkrConnectionError("Unexpected auth status payload from Client Portal Gateway.")
+
+        is_authenticated = bool(payload.get("authenticated", False))
+        is_connected = payload.get("connected", None)
+        if not is_authenticated:
+            raise IbkrConnectionError(
+                "Client Portal Gateway is reachable but not authenticated. "
+                "Complete IBKR login in the gateway UI, then retry."
+            )
+        if is_connected is False:
+            raise IbkrConnectionError(
+                "Client Portal Gateway is authenticated but not connected to broker backend."
+            )
 
     def _resolve_contract(self, instrument: Instrument) -> dict[str, str]:
         if instrument.asset_class == "equity":
@@ -108,15 +161,211 @@ class NautilusIbkrBackend:
             return {"symbol": instrument.symbol, "exchange": instrument.exchange, "secType": "IND"}
         raise IbkrRequestValidationError(f"Unsupported asset_class: {instrument.asset_class}")
 
+    def _resolve_conid(self, instrument: Instrument) -> str:
+        key = (instrument.symbol, instrument.exchange, instrument.asset_class)
+        cached = self._conid_cache.get(key)
+        if cached:
+            return cached
+
+        contract = self._resolve_contract(instrument)
+        payload = {
+            "symbol": contract["symbol"],
+            "name": True,
+            "secType": contract["secType"],
+        }
+        response = self._request_json("POST", "/v1/api/iserver/secdef/search", json_payload=payload)
+        if not isinstance(response, list):
+            raise IbkrUpstreamError("Contract search response must be a list.")
+
+        exchange_upper = instrument.exchange.upper()
+        for candidate in response:
+            if not isinstance(candidate, dict):
+                continue
+            conid = candidate.get("conid")
+            if conid in (None, ""):
+                continue
+
+            listing_exchange = str(
+                candidate.get("listingExchange")
+                or candidate.get("exchange")
+                or candidate.get("description")
+                or ""
+            ).upper()
+
+            if exchange_upper and exchange_upper not in listing_exchange:
+                # Keep searching until we find a best match for configured exchange.
+                continue
+
+            conid_str = str(conid)
+            self._conid_cache[key] = conid_str
+            return conid_str
+
+        # Fallback to first valid result if exact exchange match was not returned.
+        for candidate in response:
+            if isinstance(candidate, dict) and candidate.get("conid") not in (None, ""):
+                conid_str = str(candidate["conid"])
+                self._conid_cache[key] = conid_str
+                return conid_str
+
+        raise IbkrUpstreamError(
+            f"Unable to resolve conid for {instrument.symbol} on {instrument.exchange} ({instrument.asset_class})."
+        )
+
+    def _map_bar_size(self, bar_size: str) -> str:
+        normalized = bar_size.strip().lower()
+        if normalized in {"1 day", "1d", "day"}:
+            return "1d"
+        raise IbkrRequestValidationError(f"Unsupported bar_size for Client Portal history endpoint: {bar_size}")
+
+    def _window_period(self, start_utc: datetime, end_utc: datetime) -> str:
+        span_days = max(1, int((end_utc - start_utc).total_seconds() // 86400) + 1)
+        if span_days >= 365:
+            years = max(1, span_days // 365)
+            return f"{years}y"
+        return f"{span_days}d"
+
+    def _fetch_history(
+        self,
+        conid: str,
+        period: str,
+        bar_size: str,
+        use_regular_trading_hours: bool,
+        end_utc: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, str] = {
+            "conid": conid,
+            "period": period,
+            "bar": self._map_bar_size(bar_size),
+            "outsideRth": str(not use_regular_trading_hours).lower(),
+        }
+        if end_utc is not None:
+            params["startTime"] = end_utc.strftime("%Y%m%d-%H:%M:%S")
+
+        payload = self._request_json("GET", "/v1/api/iserver/marketdata/history", params=params)
+        if not isinstance(payload, dict):
+            raise IbkrUpstreamError("History response must be a JSON object.")
+
+        if payload.get("error"):
+            raise IbkrUpstreamError(f"IBKR history error: {payload['error']}")
+
+        rows = payload.get("data", [])
+        if rows is None:
+            return []
+        if not isinstance(rows, list):
+            raise IbkrUpstreamError("History response field 'data' must be a list.")
+        return rows
+
+    def _extract_timestamp(self, row: dict[str, Any]) -> datetime:
+        raw = row.get("t") or row.get("time") or row.get("timestamp")
+        if raw is None:
+            raise IbkrUpstreamError("History row missing timestamp field.")
+        if isinstance(raw, (int, float)):
+            return datetime.fromtimestamp(float(raw) / 1000.0, tz=timezone.utc)
+        if isinstance(raw, str):
+            cleaned = raw.strip().replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(cleaned)
+            except ValueError as exc:
+                raise IbkrUpstreamError(f"Unable to parse IBKR timestamp: {raw}") from exc
+            return to_utc(parsed)
+        raise IbkrUpstreamError(f"Unsupported history timestamp type: {type(raw)}")
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, str] | None = None,
+        json_payload: dict[str, Any] | None = None,
+    ) -> Any:
+        endpoint = f"{self._base_url}{path}"
+        if params:
+            endpoint = f"{endpoint}?{parse.urlencode(params)}"
+
+        body: bytes | None = None
+        headers: dict[str, str] = {"Accept": "application/json"}
+        if json_payload is not None:
+            body = json.dumps(json_payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        req = request.Request(endpoint, method=method.upper(), headers=headers, data=body)
+
+        try:
+            with request.urlopen(req, timeout=self.runtime.connect_timeout_seconds, context=self._ssl_context) as resp:
+                response_bytes = resp.read()
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise IbkrUpstreamError(f"IBKR HTTP {exc.code} at {path}: {detail}") from exc
+        except URLError as exc:
+            raise IbkrConnectionError(f"Unable to call Client Portal endpoint {path}: {exc}") from exc
+        except TimeoutError as exc:
+            raise IbkrConnectionError(f"Timeout calling Client Portal endpoint {path}") from exc
+
+        if not response_bytes:
+            return {}
+
+        try:
+            return json.loads(response_bytes.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise IbkrUpstreamError(f"Invalid JSON from Client Portal endpoint {path}") from exc
+
     def get_head_timestamp(self, instrument: Instrument) -> datetime | None:
-        # Concrete IBKR/Nautilus call should be wired in Step 8 orchestration.
-        # For now this backend confirms runtime readiness and exposes a clear contract.
-        _ = self._resolve_contract(instrument)
-        return None
+        conid = self._resolve_conid(instrument)
+        cursor = datetime.now(timezone.utc)
+        oldest: datetime | None = None
+
+        for _ in range(self._MAX_HEAD_PAGES):
+            rows = self._fetch_history(
+                conid=conid,
+                period=self._HEAD_PAGE_PERIOD,
+                bar_size="1 day",
+                use_regular_trading_hours=True,
+                end_utc=cursor,
+            )
+            if not rows:
+                break
+
+            timestamps = [self._extract_timestamp(row) for row in rows if isinstance(row, dict)]
+            if not timestamps:
+                break
+            chunk_oldest = min(timestamps)
+            oldest = chunk_oldest if oldest is None else min(oldest, chunk_oldest)
+
+            next_cursor = chunk_oldest - timedelta(days=1)
+            if next_cursor >= cursor:
+                break
+            cursor = next_cursor
+
+        return oldest
 
     def fetch_historical(self, request: HistoricalRequest) -> list[dict[str, Any]]:
-        _ = self._resolve_contract(request.instrument)
-        return []
+        conid = self._resolve_conid(request.instrument)
+        period = self._window_period(request.start_utc, request.end_utc)
+        rows = self._fetch_history(
+            conid=conid,
+            period=period,
+            bar_size=request.bar_size,
+            use_regular_trading_hours=request.use_regular_trading_hours,
+            end_utc=request.end_utc,
+        )
+
+        filtered: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            ts = self._extract_timestamp(row)
+            if ts < request.start_utc or ts > request.end_utc:
+                continue
+            filtered.append(
+                {
+                    "timestamp": ts,
+                    "open": row.get("o", row.get("open", 0.0)),
+                    "high": row.get("h", row.get("high", 0.0)),
+                    "low": row.get("l", row.get("low", 0.0)),
+                    "close": row.get("c", row.get("close", 0.0)),
+                    "volume": row.get("v", row.get("volume", 0.0)),
+                }
+            )
+        return filtered
 
 
 class IbkrHistoricalClient:
@@ -191,7 +440,7 @@ class IbkrHistoricalClient:
 
     def _build_backend(self) -> HistoricalBackend:
         try:
-            return NautilusIbkrBackend(runtime=self.runtime)
+            return NautilusIbkrBackend(runtime=self.runtime, logger=self.logger)
         except (IbkrDependencyError, IbkrConnectionError) as exc:
             if self.runtime.fallback_enabled:
                 self.logger.warning("IBKR/Nautilus backend unavailable. Fallback mode enabled. reason=%s", exc)

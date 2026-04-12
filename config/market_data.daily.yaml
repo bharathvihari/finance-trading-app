@@ -12,12 +12,12 @@ storage:
 
 ibkr:
   host: 127.0.0.1
-  port: 7497
+  port: 5000
   client_id: 1001
   account:
   gateway_mode: paper
   connect_timeout_seconds: 10.0
-  fallback_enabled: true
+  fallback_enabled: false
   what_to_show: TRADES
   use_regular_trading_hours: true
   timezone: UTC

@@ -42,6 +42,21 @@ Monorepo scaffold for a personal finance and trading platform that can evolve to
 4. Open architecture notes:
    - [`docs/architecture.md`](docs/architecture.md)
 
+## Run market data backfill
+
+1. Install worker dependencies:
+   - `pip install -r apps/workers/requirements.txt`
+2. Ensure import path for worker package:
+   - PowerShell: `$env:PYTHONPATH="apps/workers"`
+3. Start and authenticate IBKR Client Portal Gateway (`127.0.0.1:5000` by default).
+4. Create storage roots once:
+   - `mkdir data\\parquet\\price-data`
+   - `mkdir data\\duckdb`
+5. Validate setup with dry run:
+   - `python -m apps.workers.jobs.backfill --dry-run`
+6. Run full backfill:
+   - `python -m apps.workers.jobs.backfill`
+
 ## Design choices in this scaffold
 
 - `Postgres` for metadata, users, layouts, orders, positions, alerts.

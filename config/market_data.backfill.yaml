@@ -12,7 +12,7 @@ storage:
 
 ibkr:
   host: 127.0.0.1
-  port: 7497
+  port: 5000
   client_id: 1001
   account:
   gateway_mode: paper
@@ -39,10 +39,10 @@ universe:
     NASDAQ:
       priority_symbols: [AAPL, MSFT, NVDA]
       priority_indices: [NDX]
-      symbols: [AMZN, META, TSLA]
-      indices: []
+      symbols: [AMZN, META, TSLA, AAPL, MSFT, NVDA]
+      indices: [NDX]
     NYSE:
       priority_symbols: [BRK.B, JPM]
       priority_indices: [DJI]
-      symbols: [V, KO]
-      indices: [SPX]
+      symbols: [V, KO, BRK.B, JPM]
+      indices: [SPX, DJI]
