@@ -302,6 +302,95 @@ class DuckDbMetaStore:
         finally:
             conn.close()
 
+    def init_split_check_schema(self) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS split_checks (
+                    symbol TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    asset_class TEXT NOT NULL,
+                    last_checked_at TIMESTAMPTZ NOT NULL,
+                    last_split_date TIMESTAMPTZ,
+                    PRIMARY KEY (symbol, exchange, asset_class)
+                );
+                """
+            )
+        finally:
+            conn.close()
+
+    def get_last_split_check(
+        self,
+        symbol: str,
+        exchange: str,
+        asset_class: str,
+    ) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT symbol, exchange, asset_class, last_checked_at, last_split_date
+                FROM split_checks
+                WHERE symbol = ? AND exchange = ? AND asset_class = ?;
+                """,
+                [symbol, exchange, asset_class],
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "symbol": row[0],
+                "exchange": row[1],
+                "asset_class": row[2],
+                "last_checked_at": row[3],
+                "last_split_date": row[4],
+            }
+        finally:
+            conn.close()
+
+    def upsert_split_check(
+        self,
+        symbol: str,
+        exchange: str,
+        asset_class: str,
+        last_checked_at: datetime,
+        last_split_date: datetime | None = None,
+    ) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO split_checks (symbol, exchange, asset_class, last_checked_at, last_split_date)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, exchange, asset_class)
+                DO UPDATE SET
+                    last_checked_at = EXCLUDED.last_checked_at,
+                    last_split_date = COALESCE(EXCLUDED.last_split_date, split_checks.last_split_date);
+                """,
+                [symbol, exchange, asset_class, last_checked_at, last_split_date],
+            )
+        finally:
+            conn.close()
+
+    def reset_slices_for_symbol(
+        self,
+        symbol: str,
+        exchange: str,
+        asset_class: str,
+        frequency: str,
+    ) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                DELETE FROM backfill_slices
+                WHERE symbol = ? AND exchange = ? AND asset_class = ? AND frequency = ?;
+                """,
+                [symbol, exchange, asset_class, frequency],
+            )
+        finally:
+            conn.close()
+
     def list_backfill_slices(self, status: str | None = None, frequency: str | None = None) -> list[dict[str, Any]]:
         conn = self._connect()
         try:

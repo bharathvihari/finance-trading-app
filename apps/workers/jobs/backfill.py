@@ -1,17 +1,19 @@
 import argparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic
 
 import pandas as pd
 
 from market_data.config import load_job_config
 from market_data.duckdb_meta import DuckDbMetaStore
 from market_data.ibkr_client import HistoricalRequest, IbkrClientError, IbkrHistoricalClient
+from market_data.logger import StructuredLogger
 from market_data.parquet_store import ParquetStore
 from market_data.universe_loader import load_universe
 from market_data.windowing import paginated_windows_backward, yearly_windows_newest_to_oldest
 
-BACKFILL_PAGE_DAYS = 180
+BACKFILL_PAGE_DAYS = 1300
 
 
 def _repo_root() -> Path:
@@ -36,6 +38,7 @@ def _process_year_window(
     parquet_store: ParquetStore,
     meta: DuckDbMetaStore,
     dry_run: bool = False,
+    logger: StructuredLogger | None = None,
 ) -> tuple[int, int]:
     """Process a single year window and persist progress incrementally."""
     state = None
@@ -48,6 +51,9 @@ def _process_year_window(
             year=window.year,
         )
     if state and state.get("status") == "COMPLETE":
+        if logger:
+            logger.log("year_skipped", symbol=instrument.symbol, exchange=instrument.exchange,
+                       asset_class=instrument.asset_class, year=window.year, reason="already_complete")
         return (0, 0)
 
     resume_from = state.get("earliest_downloaded_ts") if state else None
@@ -82,10 +88,18 @@ def _process_year_window(
             frequency=frequency,
         )
 
+        _t0 = monotonic()
         try:
             bars = ibkr_client.fetch_bars(request)
+            _elapsed_ms = int((monotonic() - _t0) * 1000)
         except IbkrClientError as exc:
+            _elapsed_ms = int((monotonic() - _t0) * 1000)
             page_errors += 1
+            if logger:
+                logger.log("page_error", symbol=instrument.symbol, exchange=instrument.exchange,
+                           asset_class=instrument.asset_class, year=window.year,
+                           start=page.start_utc.date().isoformat(), end=page.end_utc.date().isoformat(),
+                           error=str(exc), elapsed_ms=_elapsed_ms)
             if not dry_run:
                 meta.append_job_error(
                     run_id=run_id,
@@ -108,6 +122,12 @@ def _process_year_window(
 
         if not bars:
             continue
+
+        if logger:
+            logger.log("page_ok", symbol=instrument.symbol, exchange=instrument.exchange,
+                       asset_class=instrument.asset_class, year=window.year,
+                       start=page.start_utc.date().isoformat(), end=page.end_utc.date().isoformat(),
+                       rows=len(bars), elapsed_ms=_elapsed_ms)
 
         frame = _rows_to_frame(bars)
         if not dry_run:
@@ -170,6 +190,12 @@ def _process_year_window(
             row_count=written_rows,
         )
 
+    if logger:
+        logger.log("year_end", symbol=instrument.symbol, exchange=instrument.exchange,
+                   asset_class=instrument.asset_class, year=window.year,
+                   rows_written=written_rows, page_errors=page_errors,
+                   status="complete" if is_complete else "partial")
+
     return (written_rows, page_errors)
 
 
@@ -188,12 +214,20 @@ def run_backfill(dry_run: bool | None = None) -> None:
         meta.init_schema()
         run_id = meta.start_job_run(job_name=cfg.job_name, mode=cfg.mode)
 
+    logger = StructuredLogger(job_name=cfg.job_name, log_dir=root / "data" / "logs")
+    logger.set_run_id(run_id)
+
     try:
         print(f"[{datetime.now(timezone.utc).isoformat()}] backfill job started (run_id={run_id})")
         if is_dry_run:
             print("mode: DRY RUN (no parquet/db writes)")
         print(f"duckdb metadata: {root / cfg.storage.duckdb_path}")
         print(f"ibkr gateway: {ibkr_client.runtime.host}:{ibkr_client.runtime.port} mode={ibkr_client.runtime.gateway_mode}")
+
+        logger.log("job_start", dry_run=is_dry_run, mode=cfg.mode,
+                   ibkr_host=ibkr_client.runtime.host, ibkr_port=ibkr_client.runtime.port,
+                   gateway_mode=ibkr_client.runtime.gateway_mode)
+
         processed_count = 0
         failed_count = 0
 
@@ -202,6 +236,8 @@ def run_backfill(dry_run: bool | None = None) -> None:
                 head = ibkr_client.get_head_timestamp(instrument)
             except IbkrClientError as exc:
                 failed_count += 1
+                logger.log("symbol_head_error", symbol=instrument.symbol, exchange=instrument.exchange,
+                           asset_class=instrument.asset_class, error=str(exc))
                 if not is_dry_run:
                     meta.append_job_error(
                         run_id=run_id,
@@ -229,6 +265,7 @@ def run_backfill(dry_run: bool | None = None) -> None:
                     parquet_store=parquet_store,
                     meta=meta,
                     dry_run=is_dry_run,
+                    logger=logger,
                 )
                 if rows_written > 0:
                     processed_count += rows_written
@@ -241,11 +278,15 @@ def run_backfill(dry_run: bool | None = None) -> None:
                 processed_count=processed_count,
                 failed_count=failed_count,
             )
+        logger.log("job_end", status="complete", processed=processed_count, failed=failed_count)
     except Exception as exc:
+        logger.log("job_end", status="failed", error=str(exc))
         if not is_dry_run:
             meta.append_job_error(run_id=run_id, scope="job", error_message=str(exc))
             meta.finish_job_run(run_id=run_id, status="FAILED", processed_count=0, failed_count=1, notes=str(exc))
         raise
+    finally:
+        logger.close()
 
 
 if __name__ == "__main__":

@@ -126,6 +126,50 @@ class ParquetStore:
             return ts.astimezone(timezone.utc)
         return pd.to_datetime(ts, utc=True).to_pydatetime()
 
+    def delete_symbol_data(
+        self,
+        symbol: str,
+        exchange: str,
+        asset_class: str,
+        frequency: str,
+    ) -> int:
+        """Remove all rows for a symbol from parquet partitions, rewriting files in-place.
+
+        Returns the total number of rows deleted.
+        """
+        base_dir = (
+            self.root
+            / f"asset_class={asset_class}"
+            / f"exchange={exchange}"
+            / f"frequency={frequency}"
+        )
+        if not base_dir.exists():
+            return 0
+
+        total_deleted = 0
+        for year_dir in sorted(base_dir.iterdir()):
+            if not year_dir.is_dir() or not year_dir.name.startswith("year="):
+                continue
+            parquet_files = list(year_dir.glob("*.parquet"))
+            if not parquet_files:
+                continue
+
+            frames = [pd.read_parquet(f) for f in parquet_files]
+            combined = pd.concat(frames, ignore_index=True)
+
+            mask = combined["symbol"] == symbol
+            total_deleted += int(mask.sum())
+            remaining = combined[~mask]
+
+            for f in parquet_files:
+                f.unlink()
+
+            if not remaining.empty:
+                file_name = f"part-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{uuid4().hex[:8]}.parquet"
+                remaining.to_parquet(year_dir / file_name, index=False)
+
+        return total_deleted
+
     def read_bars(
         self,
         symbol: str,

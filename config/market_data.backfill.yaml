@@ -18,7 +18,7 @@ ibkr:
   gateway_mode: paper
   connect_timeout_seconds: 10.0
   fallback_enabled: true
-  what_to_show: TRADES
+  what_to_show: ADJUSTED_LAST
   use_regular_trading_hours: true
   timezone: UTC
 
@@ -26,8 +26,8 @@ rate_limits:
   max_requests_per_window: 60
   window_seconds: 600
   identical_request_cooldown_seconds: 15
-  utilization_target_pct: 65
-  base_delay_seconds: 0.8
+  utilization_target_pct: 85
+  base_delay_seconds: 0.4
   jitter_seconds: 0.6
   max_retries: 3
   backoff_base_seconds: 1.0
