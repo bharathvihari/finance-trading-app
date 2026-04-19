@@ -212,6 +212,9 @@ F. CONFIGURATION & EXTENSIBILITY
        - Each frequency must map to its own Parquet directory tree (e.g., `price-data/asset_class=equity/exchange=NASDAQ/frequency=daily/...`, `price-data/asset_class=equity/exchange=NASDAQ/frequency=1H/...`).  
      - whatToShow (TRADES vs ADJUSTED_LAST).  
      - use_regular_trading_hours flag.  
+     - Exchange `reference_symbol` used to infer each exchange's latest traded date.  
+     - Exchange reference fallback order when inferring latest traded date: configured `reference_symbol`, then first configured index, then first configured stock symbol.  
+     - `fail_on_unresolved_exchange_last_traded` guard to fail the backfill job if an exchange latest traded date cannot be resolved from all fallbacks.  
      - Rate limit parameters (requests per window, window size, jitter).  
      - Paths for Parquet storage and DuckDB database.  
 

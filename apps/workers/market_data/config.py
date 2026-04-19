@@ -42,6 +42,7 @@ class IbkrConfig(BaseModel):
 
 
 class ExchangeConfig(BaseModel):
+    reference_symbol: str | None = None
     symbols: list[str] = Field(default_factory=list)
     priority_symbols: list[str] = Field(default_factory=list)
     indices: list[str] = Field(default_factory=list)
@@ -56,6 +57,7 @@ class JobConfig(BaseModel):
     job_name: str
     mode: Literal["backfill", "daily"]
     dry_run: bool = False
+    fail_on_unresolved_exchange_last_traded: bool = False
     frequency: FrequencyConfig = Field(default_factory=FrequencyConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     ibkr: IbkrConfig = Field(default_factory=IbkrConfig)

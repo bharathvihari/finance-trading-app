@@ -76,6 +76,47 @@ class DuckDbMetaStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS parquet_symbols (
+                    symbol TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    asset_class TEXT NOT NULL,
+                    frequency TEXT NOT NULL,
+                    first_seen_at TIMESTAMPTZ NOT NULL,
+                    last_seen_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (symbol, exchange, asset_class, frequency)
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS exchange_trading_dates (
+                    exchange TEXT NOT NULL,
+                    frequency TEXT NOT NULL,
+                    last_traded_ts TIMESTAMPTZ NOT NULL,
+                    checked_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (exchange, frequency)
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS symbol_sync_status (
+                    symbol TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    asset_class TEXT NOT NULL,
+                    frequency TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    earliest_required_ts TIMESTAMPTZ,
+                    earliest_ts TIMESTAMPTZ,
+                    latest_ts TIMESTAMPTZ,
+                    last_traded_ts TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (symbol, exchange, asset_class, frequency)
+                );
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS job_errors (
                     run_id TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL,
@@ -186,8 +227,16 @@ class DuckDbMetaStore:
                 ON CONFLICT(symbol, exchange, asset_class, frequency, year)
                 DO UPDATE SET
                     status = EXCLUDED.status,
-                    earliest_downloaded_ts = COALESCE(EXCLUDED.earliest_downloaded_ts, backfill_slices.earliest_downloaded_ts),
-                    latest_downloaded_ts = COALESCE(EXCLUDED.latest_downloaded_ts, backfill_slices.latest_downloaded_ts),
+                    earliest_downloaded_ts = COALESCE(
+                        LEAST(backfill_slices.earliest_downloaded_ts, EXCLUDED.earliest_downloaded_ts),
+                        backfill_slices.earliest_downloaded_ts,
+                        EXCLUDED.earliest_downloaded_ts
+                    ),
+                    latest_downloaded_ts = COALESCE(
+                        GREATEST(backfill_slices.latest_downloaded_ts, EXCLUDED.latest_downloaded_ts),
+                        backfill_slices.latest_downloaded_ts,
+                        EXCLUDED.latest_downloaded_ts
+                    ),
                     last_success_request_at = COALESCE(EXCLUDED.last_success_request_at, backfill_slices.last_success_request_at),
                     last_error = EXCLUDED.last_error,
                     updated_at = EXCLUDED.updated_at;
@@ -276,6 +325,229 @@ class DuckDbMetaStore:
                 """,
                 [symbol, exchange, asset_class, frequency, min_ts, max_ts, row_count, now],
             )
+        finally:
+            conn.close()
+
+    def get_coverage(
+        self,
+        symbol: str,
+        exchange: str,
+        asset_class: str,
+        frequency: str,
+    ) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT min_ts, max_ts, row_count, updated_at
+                FROM data_coverage
+                WHERE symbol = ? AND exchange = ? AND asset_class = ? AND frequency = ?;
+                """,
+                [symbol, exchange, asset_class, frequency],
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "min_ts": row[0],
+                "max_ts": row[1],
+                "row_count": row[2],
+                "updated_at": row[3],
+            }
+        finally:
+            conn.close()
+
+    def upsert_parquet_symbol(
+        self,
+        symbol: str,
+        exchange: str,
+        asset_class: str,
+        frequency: str,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO parquet_symbols (
+                    symbol, exchange, asset_class, frequency, first_seen_at, last_seen_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, exchange, asset_class, frequency)
+                DO UPDATE SET
+                    last_seen_at = EXCLUDED.last_seen_at;
+                """,
+                [symbol, exchange, asset_class, frequency, now, now],
+            )
+        finally:
+            conn.close()
+
+    def list_parquet_symbols(self, frequency: str | None = None) -> list[dict[str, Any]]:
+        conn = self._connect()
+        try:
+            where: list[str] = []
+            params: list[Any] = []
+            if frequency is not None:
+                where.append("frequency = ?")
+                params.append(frequency)
+
+            query = """
+                SELECT symbol, exchange, asset_class, frequency, first_seen_at, last_seen_at
+                FROM parquet_symbols
+            """
+            if where:
+                query += " WHERE " + " AND ".join(where)
+            query += " ORDER BY exchange, symbol;"
+
+            rows = conn.execute(query, params).fetchall()
+            out: list[dict[str, Any]] = []
+            for row in rows:
+                out.append(
+                    {
+                        "symbol": row[0],
+                        "exchange": row[1],
+                        "asset_class": row[2],
+                        "frequency": row[3],
+                        "first_seen_at": row[4],
+                        "last_seen_at": row[5],
+                    }
+                )
+            return out
+        finally:
+            conn.close()
+
+    def upsert_exchange_last_traded_date(
+        self,
+        exchange: str,
+        frequency: str,
+        last_traded_ts: datetime,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO exchange_trading_dates (
+                    exchange, frequency, last_traded_ts, checked_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(exchange, frequency)
+                DO UPDATE SET
+                    last_traded_ts = EXCLUDED.last_traded_ts,
+                    checked_at = EXCLUDED.checked_at;
+                """,
+                [exchange, frequency, last_traded_ts, now],
+            )
+        finally:
+            conn.close()
+
+    def get_exchange_last_traded_date(
+        self,
+        exchange: str,
+        frequency: str,
+    ) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT exchange, frequency, last_traded_ts, checked_at
+                FROM exchange_trading_dates
+                WHERE exchange = ? AND frequency = ?;
+                """,
+                [exchange, frequency],
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "exchange": row[0],
+                "frequency": row[1],
+                "last_traded_ts": row[2],
+                "checked_at": row[3],
+            }
+        finally:
+            conn.close()
+
+    def upsert_symbol_sync_status(
+        self,
+        symbol: str,
+        exchange: str,
+        asset_class: str,
+        frequency: str,
+        status: str,
+        earliest_required_ts: datetime | None,
+        earliest_ts: datetime | None,
+        latest_ts: datetime | None,
+        last_traded_ts: datetime | None,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO symbol_sync_status (
+                    symbol, exchange, asset_class, frequency, status,
+                    earliest_required_ts, earliest_ts, latest_ts, last_traded_ts, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, exchange, asset_class, frequency)
+                DO UPDATE SET
+                    status = EXCLUDED.status,
+                    earliest_required_ts = COALESCE(EXCLUDED.earliest_required_ts, symbol_sync_status.earliest_required_ts),
+                    earliest_ts = COALESCE(EXCLUDED.earliest_ts, symbol_sync_status.earliest_ts),
+                    latest_ts = COALESCE(EXCLUDED.latest_ts, symbol_sync_status.latest_ts),
+                    last_traded_ts = COALESCE(EXCLUDED.last_traded_ts, symbol_sync_status.last_traded_ts),
+                    updated_at = EXCLUDED.updated_at;
+                """,
+                [
+                    symbol,
+                    exchange,
+                    asset_class,
+                    frequency,
+                    status,
+                    earliest_required_ts,
+                    earliest_ts,
+                    latest_ts,
+                    last_traded_ts,
+                    now,
+                ],
+            )
+        finally:
+            conn.close()
+
+    def get_symbol_sync_status(
+        self,
+        symbol: str,
+        exchange: str,
+        asset_class: str,
+        frequency: str,
+    ) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT symbol, exchange, asset_class, frequency, status,
+                       earliest_required_ts, earliest_ts, latest_ts, last_traded_ts, updated_at
+                FROM symbol_sync_status
+                WHERE symbol = ? AND exchange = ? AND asset_class = ? AND frequency = ?;
+                """,
+                [symbol, exchange, asset_class, frequency],
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "symbol": row[0],
+                "exchange": row[1],
+                "asset_class": row[2],
+                "frequency": row[3],
+                "status": row[4],
+                "earliest_required_ts": row[5],
+                "earliest_ts": row[6],
+                "latest_ts": row[7],
+                "last_traded_ts": row[8],
+                "updated_at": row[9],
+            }
         finally:
             conn.close()
 
