@@ -1,5 +1,7 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
+
+from app.auth.dependencies import CurrentUser, get_current_user
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -11,7 +13,10 @@ class DashboardQuery(BaseModel):
 
 
 @router.post("/query")
-async def query_dashboard(payload: DashboardQuery) -> dict:
+async def query_dashboard(
+    payload: DashboardQuery,
+    _: CurrentUser = Depends(get_current_user),
+) -> dict:
     # Placeholder for analytics engine integration (Parquet + DB reads)
     return {
         "ticker": payload.ticker,

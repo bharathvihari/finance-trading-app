@@ -1,8 +1,9 @@
+import os
 from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class RateLimitConfig(BaseModel):
@@ -26,6 +27,20 @@ class FrequencyConfig(BaseModel):
 class StorageConfig(BaseModel):
     parquet_root: str = "data/parquet/price-data"
     duckdb_path: str = "data/duckdb/market_data.duckdb"
+
+
+class PostgresConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    enabled: bool = False
+    host: str = Field(default_factory=lambda: os.getenv("POSTGRES_HOST", "127.0.0.1"))
+    port: int = Field(default_factory=lambda: int(os.getenv("POSTGRES_PORT", "5432")))
+    database: str = Field(default_factory=lambda: os.getenv("POSTGRES_DB", "trading_app"))
+    user: str = Field(default_factory=lambda: os.getenv("POSTGRES_USER", "trading_user"))
+    password: str = Field(default_factory=lambda: os.getenv("POSTGRES_PASSWORD", "trading_pass"))
+    schema_name: str = Field(default="market_data", alias="schema")
+    bars_table: str = "daily_bars"
+    hot_window_months: int = Field(default=6, ge=1, le=24)
 
 
 class IbkrConfig(BaseModel):
@@ -55,11 +70,12 @@ class UniverseConfig(BaseModel):
 
 class JobConfig(BaseModel):
     job_name: str
-    mode: Literal["backfill", "daily"]
+    mode: Literal["backfill", "daily", "archive"]
     dry_run: bool = False
     fail_on_unresolved_exchange_last_traded: bool = False
     frequency: FrequencyConfig = Field(default_factory=FrequencyConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    postgres: PostgresConfig = Field(default_factory=PostgresConfig)
     ibkr: IbkrConfig = Field(default_factory=IbkrConfig)
     rate_limits: RateLimitConfig = Field(default_factory=RateLimitConfig)
     universe: UniverseConfig = Field(default_factory=UniverseConfig)

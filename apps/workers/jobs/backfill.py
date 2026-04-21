@@ -6,10 +6,12 @@ from time import monotonic
 import pandas as pd
 
 from market_data.config import load_job_config
+from market_data.dedup import deduplicate_bars
 from market_data.duckdb_meta import DuckDbMetaStore
 from market_data.ibkr_client import HistoricalRequest, IbkrClientError, IbkrHistoricalClient
 from market_data.logger import StructuredLogger
 from market_data.parquet_store import ParquetStore
+from market_data.postgres_store import PostgresBarStore
 from market_data.universe_loader import load_universe
 from market_data.windowing import (
     paginated_windows_backward,
@@ -155,6 +157,8 @@ def _process_year_window(
     ibkr_client: IbkrHistoricalClient,
     parquet_store: ParquetStore,
     meta: DuckDbMetaStore,
+    hot_store: PostgresBarStore | None = None,
+    hot_cutoff_utc: datetime | None = None,
     dry_run: bool = False,
     logger: StructuredLogger | None = None,
 ) -> tuple[int, int]:
@@ -251,7 +255,9 @@ def _process_year_window(
                        start=page.start_utc.date().isoformat(), end=page.end_utc.date().isoformat(),
                        rows=len(bars), elapsed_ms=_elapsed_ms)
 
-        frame = _rows_to_frame(bars)
+        frame = deduplicate_bars(_rows_to_frame(bars))
+        hot_frame, cold_frame = _split_hot_cold_frames(frame, hot_cutoff_utc if hot_store is not None else None)
+
         if not dry_run:
             parquet_store.write_partition(frame)
             meta.upsert_parquet_symbol(
@@ -280,6 +286,18 @@ def _process_year_window(
                 latest_downloaded_ts=max_ts,
                 last_success_request_at=datetime.now(timezone.utc),
                 last_error=None,
+            )
+
+        if logger and hot_store is not None:
+            logger.log(
+                "tiered_write",
+                symbol=instrument.symbol,
+                exchange=instrument.exchange,
+                asset_class=instrument.asset_class,
+                year=window.year,
+                hot_rows=len(hot_frame),
+                cold_rows=len(cold_frame),
+                hot_cutoff_utc=hot_cutoff_utc.isoformat() if hot_cutoff_utc else None,
             )
 
     final_state = state
@@ -351,12 +369,20 @@ def run_backfill(dry_run: bool | None = None) -> None:
     ibkr_client = IbkrHistoricalClient.from_ibkr_config(cfg.ibkr, rate_limits=cfg.rate_limits)
     parquet_store = ParquetStore(root / cfg.storage.parquet_root)
     universe = load_universe(cfg)
+    postgres_cfg = getattr(cfg, "postgres", None)
+    hot_store_enabled = bool(getattr(postgres_cfg, "enabled", False))
+    hot_window_months = int(getattr(postgres_cfg, "hot_window_months", 6))
+    hot_cutoff_utc = _hot_window_cutoff(datetime.now(timezone.utc), hot_window_months) if hot_store_enabled else None
+
+    hot_store = PostgresBarStore.from_config(postgres_cfg) if hot_store_enabled else None
 
     is_dry_run = getattr(cfg, "dry_run", False) if dry_run is None else dry_run
 
     run_id = "dry-run"
     if not is_dry_run:
         meta.init_schema()
+        if hot_store is not None:
+            hot_store.init_schema()
         run_id = meta.start_job_run(job_name=cfg.job_name, mode=cfg.mode)
 
     logger = StructuredLogger(job_name=cfg.job_name, log_dir=root / "data" / "logs")
@@ -368,10 +394,14 @@ def run_backfill(dry_run: bool | None = None) -> None:
             print("mode: DRY RUN (no parquet/db writes)")
         print(f"duckdb metadata: {root / cfg.storage.duckdb_path}")
         print(f"ibkr gateway: {ibkr_client.runtime.host}:{ibkr_client.runtime.port} mode={ibkr_client.runtime.gateway_mode}")
+        if hot_store_enabled and hot_cutoff_utc is not None:
+            print(f"tiered mode: hot->postgres (cutoff={hot_cutoff_utc.date().isoformat()}), cold->parquet")
 
         logger.log("job_start", dry_run=is_dry_run, mode=cfg.mode,
                    ibkr_host=ibkr_client.runtime.host, ibkr_port=ibkr_client.runtime.port,
-                   gateway_mode=ibkr_client.runtime.gateway_mode)
+                   gateway_mode=ibkr_client.runtime.gateway_mode,
+                   hot_store_enabled=hot_store_enabled,
+                   hot_cutoff_utc=hot_cutoff_utc.isoformat() if hot_cutoff_utc else None)
 
         processed_count = 0
         failed_count = 0
@@ -489,6 +519,8 @@ def run_backfill(dry_run: bool | None = None) -> None:
                     ibkr_client=ibkr_client,
                     parquet_store=parquet_store,
                     meta=meta,
+                    hot_store=hot_store,
+                    hot_cutoff_utc=hot_cutoff_utc,
                     dry_run=is_dry_run,
                     logger=logger,
                 )

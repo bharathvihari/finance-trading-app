@@ -2,10 +2,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
+import pandas as pd
+
 # Allow importing worker package when running tests from repo root.
 sys.path.append(str(Path(__file__).resolve().parents[2] / "apps" / "workers"))
 
-from jobs.backfill import _process_year_window  # noqa: E402
+from jobs.backfill import _process_year_window, _split_hot_cold_frames  # noqa: E402
 from market_data.models import Instrument  # noqa: E402
 from market_data.windowing import TimeWindow  # noqa: E402
 
@@ -31,9 +33,22 @@ class _StubIbkrClient:
 class _StubParquetStore:
     def __init__(self) -> None:
         self.writes = 0
+        self.last_write_rows = 0
 
     def write_partition(self, df) -> None:
         self.writes += len(df)
+        self.last_write_rows = len(df)
+
+
+class _StubHotStore:
+    def __init__(self) -> None:
+        self.upserts = 0
+        self.last_upsert_rows = 0
+
+    def upsert_bars(self, df) -> int:
+        self.upserts += len(df)
+        self.last_upsert_rows = len(df)
+        return len(df)
 
 
 class _StubMetaStore:
@@ -146,3 +161,50 @@ def test_process_year_window_skips_complete_slice(tmp_path: Path) -> None:
 
     assert rows_written == 0
     assert errors == 0
+
+
+def test_split_hot_cold_frames_routes_using_cutoff() -> None:
+    frame = pd.DataFrame(
+        [
+            {"timestamp": datetime(2025, 9, 30, tzinfo=timezone.utc), "symbol": "AAPL"},
+            {"timestamp": datetime(2025, 10, 1, tzinfo=timezone.utc), "symbol": "AAPL"},
+        ]
+    )
+
+    hot, cold = _split_hot_cold_frames(frame, datetime(2025, 10, 1, tzinfo=timezone.utc))
+
+    assert len(hot) == 1
+    assert len(cold) == 1
+
+
+def test_process_year_window_writes_hot_rows_to_postgres(tmp_path: Path) -> None:
+    _ = tmp_path
+    meta = _StubMetaStore()
+    parquet_store = _StubParquetStore()
+    hot_store = _StubHotStore()
+
+    instrument = Instrument(symbol="AAPL", exchange="NASDAQ", asset_class="equity", priority=True)
+    window = TimeWindow(
+        start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        end_utc=datetime(2026, 2, 1, tzinfo=timezone.utc),
+    )
+
+    rows_written, errors = _process_year_window(
+        run_id="test-run",
+        instrument=instrument,
+        frequency="daily",
+        bar_size="1 day",
+        what_to_show="TRADES",
+        use_rth=True,
+        window=window,
+        ibkr_client=_StubIbkrClient(),
+        parquet_store=parquet_store,
+        meta=meta,
+        hot_store=hot_store,
+        hot_cutoff_utc=datetime(2025, 10, 1, tzinfo=timezone.utc),
+    )
+
+    assert rows_written == 1
+    assert errors == 0
+    assert hot_store.upserts == 1
+    assert parquet_store.writes == 0

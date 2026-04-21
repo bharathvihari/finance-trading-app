@@ -11,6 +11,17 @@ storage:
   parquet_root: data/parquet/price-data
   duckdb_path: data/duckdb/market_data.duckdb
 
+postgres:
+  enabled: true
+  host: 127.0.0.1
+  port: 5432
+  database: trading_app
+  user: trading_user
+  password: trading_pass
+  schema: market_data
+  bars_table: daily_bars
+  hot_window_months: 6
+
 ibkr:
   host: 127.0.0.1
   port: 5000

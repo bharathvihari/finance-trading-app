@@ -8,3 +8,4 @@ PyYAML==6.0.2
 yfinance>=0.2.50
 pydantic==2.11.9
 nautilus_trader==1.220.0
+arq==0.26.1

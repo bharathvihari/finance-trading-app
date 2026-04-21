@@ -18,11 +18,17 @@ try:
 except Exception:  # pragma: no cover - allows lightweight imports without optional deps
     ParquetStore = None  # type: ignore[assignment]
 
+try:
+    from .postgres_store import PostgresBarStore
+except Exception:  # pragma: no cover - allows lightweight imports without optional deps
+    PostgresBarStore = None  # type: ignore[assignment]
+
 __all__ = [
     "JobConfig",
     "HistoricalRequest",
     "IbkrHistoricalClient",
     "ParquetStore",
+    "PostgresBarStore",
     "TimeWindow",
     "load_job_config",
     "load_universe",
