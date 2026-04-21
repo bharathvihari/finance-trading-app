@@ -21,6 +21,8 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pandas as pd
+
 from market_data.config import load_job_config
 from market_data.duckdb_meta import DuckDbMetaStore
 from market_data.logger import StructuredLogger
@@ -45,6 +47,61 @@ def _hot_cutoff(hot_window_months: int) -> datetime:
         month += 12
         year -= 1
     return datetime(year, month, 1, tzinfo=timezone.utc)
+
+
+def _update_archive_metadata(meta: DuckDbMetaStore, archived_df: pd.DataFrame) -> int:
+    """Update DuckDB symbol/coverage metadata for archived rows."""
+    if archived_df.empty:
+        return 0
+
+    grouped = archived_df.groupby(["symbol", "exchange", "asset_class", "frequency"], dropna=False)
+    updates = 0
+    for (symbol, exchange, asset_class, frequency), symbol_df in grouped:
+        min_ts = symbol_df["timestamp"].min().to_pydatetime()
+        max_ts = symbol_df["timestamp"].max().to_pydatetime()
+        row_count = len(symbol_df)
+
+        meta.upsert_parquet_symbol(
+            symbol=str(symbol),
+            exchange=str(exchange),
+            asset_class=str(asset_class),
+            frequency=str(frequency),
+        )
+        meta.upsert_coverage(
+            symbol=str(symbol),
+            exchange=str(exchange),
+            asset_class=str(asset_class),
+            frequency=str(frequency),
+            min_ts=min_ts,
+            max_ts=max_ts,
+            row_count=row_count,
+        )
+        updates += 1
+
+    return updates
+
+
+def _update_combo_sync_watermark(
+    meta: DuckDbMetaStore,
+    exchange: str,
+    frequency: str,
+    asset_class: str,
+) -> datetime | None:
+    combo_sync_ts = meta.get_combo_parquet_sync_ts(
+        exchange=exchange,
+        frequency=frequency,
+        asset_class=asset_class,
+    )
+    if combo_sync_ts is None:
+        return None
+    combo_sync_ts = datetime(combo_sync_ts.year, combo_sync_ts.month, combo_sync_ts.day, tzinfo=timezone.utc)
+    meta.upsert_exchange_last_traded_date(
+        exchange=exchange,
+        frequency=frequency,
+        asset_class=asset_class,
+        last_traded_ts=combo_sync_ts,
+    )
+    return combo_sync_ts
 
 
 def run_archive(dry_run: bool | None = None) -> None:
@@ -102,6 +159,8 @@ def run_archive(dry_run: bool | None = None) -> None:
         total_rows = 0
         total_partitions = 0
         failed_partitions = 0
+        metadata_updates = 0
+        combo_sync_updates = 0
 
         for part in partitions:
             asset_class = part["asset_class"]
@@ -150,9 +209,19 @@ def run_archive(dry_run: bool | None = None) -> None:
                         year=year,
                         cutoff_utc=cutoff_utc,
                     )
+                    metadata_updates += _update_archive_metadata(meta, df)
+                    combo_sync_ts = _update_combo_sync_watermark(
+                        meta=meta,
+                        exchange=exchange,
+                        frequency=frequency,
+                        asset_class=asset_class,
+                    )
+                    if combo_sync_ts is not None:
+                        combo_sync_updates += 1
                 else:
                     written_files = []
                     deleted = 0
+                    combo_sync_ts = None
 
                 total_rows += actual_rows
                 total_partitions += 1
@@ -166,6 +235,9 @@ def run_archive(dry_run: bool | None = None) -> None:
                     rows_read=actual_rows,
                     rows_deleted=deleted,
                     parquet_files_written=len(written_files),
+                    metadata_updates=metadata_updates,
+                    combo_sync_updates=combo_sync_updates,
+                    combo_last_traded_ts=combo_sync_ts.isoformat() if combo_sync_ts else None,
                 )
                 print(
                     f"  archived {asset_class}/{exchange}/{frequency}/year={year}: "
@@ -198,6 +270,8 @@ def run_archive(dry_run: bool | None = None) -> None:
             partitions_archived=total_partitions,
             rows_archived=total_rows,
             failed_partitions=failed_partitions,
+            metadata_updates=metadata_updates,
+            combo_sync_updates=combo_sync_updates,
         )
         print(
             f"[{datetime.now(timezone.utc).isoformat()}] archive job {final_status.lower()} — "

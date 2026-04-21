@@ -38,6 +38,37 @@ def _normalize_trading_date(ts: datetime) -> datetime:
     return datetime(ts.year, ts.month, ts.day, tzinfo=timezone.utc)
 
 
+def _month_start_utc(value: datetime) -> datetime:
+    return datetime(value.year, value.month, 1, tzinfo=timezone.utc)
+
+
+def _subtract_months(month_anchor: datetime, months: int) -> datetime:
+    month = month_anchor.month - months
+    year = month_anchor.year
+    while month <= 0:
+        month += 12
+        year -= 1
+    return datetime(year, month, 1, tzinfo=timezone.utc)
+
+
+def _hot_window_cutoff(now_utc: datetime, hot_window_months: int) -> datetime:
+    return _subtract_months(_month_start_utc(now_utc), hot_window_months)
+
+
+def _split_hot_cold_frames(frame: pd.DataFrame, hot_cutoff_utc: datetime | None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if frame.empty:
+        return frame.copy(), frame.copy()
+    if hot_cutoff_utc is None:
+        return frame.copy(), frame.iloc[0:0].copy()
+
+    out = frame.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
+    hot_mask = out["timestamp"] >= hot_cutoff_utc
+    hot_frame = out.loc[hot_mask].copy()
+    cold_frame = out.loc[~hot_mask].copy()
+    return hot_frame, cold_frame
+
+
 def _find_instrument(universe, exchange: str, symbol: str, asset_class: str | None = None):
     symbol_upper = symbol.strip().upper()
     if not symbol_upper:
@@ -53,7 +84,7 @@ def _find_instrument(universe, exchange: str, symbol: str, asset_class: str | No
     return None
 
 
-def _exchange_reference_candidates(cfg, universe, exchange: str):
+def _exchange_reference_candidates(cfg, universe, exchange: str, asset_class: str):
     exchange_cfg = cfg.universe.exchanges.get(exchange)
     if exchange_cfg is None:
         return []
@@ -72,26 +103,30 @@ def _exchange_reference_candidates(cfg, universe, exchange: str):
 
     configured_ref = (exchange_cfg.reference_symbol or "").strip().upper()
     if configured_ref:
-        if configured_ref in {s.strip().upper() for s in [*exchange_cfg.priority_indices, *exchange_cfg.indices]}:
-            _append(_find_instrument(universe, exchange, configured_ref, asset_class="index"))
-        else:
-            _append(_find_instrument(universe, exchange, configured_ref, asset_class="equity"))
-            _append(_find_instrument(universe, exchange, configured_ref, asset_class="index"))
+        _append(_find_instrument(universe, exchange, configured_ref, asset_class=asset_class))
 
-    first_index_symbol = next(
-        (
-            symbol.strip().upper()
-            for symbol in [*exchange_cfg.priority_indices, *exchange_cfg.indices]
-            if symbol.strip()
-        ),
-        None,
-    )
-    if first_index_symbol:
-        _append(_find_instrument(universe, exchange, first_index_symbol, asset_class="index"))
-
-    first_stock_symbol = next((symbol.strip().upper() for symbol in exchange_cfg.symbols if symbol.strip()), None)
-    if first_stock_symbol:
-        _append(_find_instrument(universe, exchange, first_stock_symbol, asset_class="equity"))
+    if asset_class == "index":
+        first_index_symbol = next(
+            (
+                symbol.strip().upper()
+                for symbol in [*exchange_cfg.priority_indices, *exchange_cfg.indices]
+                if symbol.strip()
+            ),
+            None,
+        )
+        if first_index_symbol:
+            _append(_find_instrument(universe, exchange, first_index_symbol, asset_class="index"))
+    else:
+        first_stock_symbol = next(
+            (
+                symbol.strip().upper()
+                for symbol in [*exchange_cfg.priority_symbols, *exchange_cfg.symbols]
+                if symbol.strip()
+            ),
+            None,
+        )
+        if first_stock_symbol:
+            _append(_find_instrument(universe, exchange, first_stock_symbol, asset_class="equity"))
 
     return candidates
 
@@ -193,6 +228,7 @@ def _process_year_window(
         )
 
     written_rows = 0
+    parquet_written_rows = 0
     page_errors = 0
     touched_lower_bound = False
 
@@ -257,15 +293,34 @@ def _process_year_window(
 
         frame = deduplicate_bars(_rows_to_frame(bars))
         hot_frame, cold_frame = _split_hot_cold_frames(frame, hot_cutoff_utc if hot_store is not None else None)
+        parquet_frame = cold_frame if hot_store is not None else frame
 
         if not dry_run:
-            parquet_store.write_partition(frame)
-            meta.upsert_parquet_symbol(
-                symbol=instrument.symbol,
-                exchange=instrument.exchange,
-                asset_class=instrument.asset_class,
-                frequency=frequency,
-            )
+            wrote_to_parquet = False
+            if hot_store is not None and not hot_frame.empty:
+                hot_store.upsert_bars(hot_frame)
+            if not parquet_frame.empty:
+                parquet_store.write_partition(parquet_frame)
+                wrote_to_parquet = True
+            if wrote_to_parquet:
+                meta.upsert_parquet_symbol(
+                    symbol=instrument.symbol,
+                    exchange=instrument.exchange,
+                    asset_class=instrument.asset_class,
+                    frequency=frequency,
+                )
+                parquet_written_rows += len(parquet_frame)
+                parquet_min_ts = parquet_frame["timestamp"].min().to_pydatetime()
+                parquet_max_ts = parquet_frame["timestamp"].max().to_pydatetime()
+                meta.upsert_coverage(
+                    symbol=instrument.symbol,
+                    exchange=instrument.exchange,
+                    asset_class=instrument.asset_class,
+                    frequency=frequency,
+                    min_ts=parquet_min_ts,
+                    max_ts=parquet_max_ts,
+                    row_count=parquet_written_rows,
+                )
 
         min_ts = frame["timestamp"].min().to_pydatetime()
         max_ts = frame["timestamp"].max().to_pydatetime()
@@ -340,19 +395,6 @@ def _process_year_window(
             last_error=None,
         )
 
-    if written_rows > 0 and not dry_run:
-        current_min = final_state.get("earliest_downloaded_ts") if final_state else None
-        current_max = final_state.get("latest_downloaded_ts") if final_state else None
-        meta.upsert_coverage(
-            symbol=instrument.symbol,
-            exchange=instrument.exchange,
-            asset_class=instrument.asset_class,
-            frequency=frequency,
-            min_ts=current_min,
-            max_ts=current_max,
-            row_count=written_rows,
-        )
-
     if logger:
         logger.log("year_end", symbol=instrument.symbol, exchange=instrument.exchange,
                    asset_class=instrument.asset_class, year=window.year,
@@ -406,13 +448,14 @@ def run_backfill(dry_run: bool | None = None) -> None:
         processed_count = 0
         failed_count = 0
         now_utc = datetime.now(timezone.utc)
-        unresolved_exchanges: list[str] = []
+        combo_keys = sorted({(inst.exchange, inst.asset_class) for inst in universe.instruments})
+        unresolved_combos: list[str] = []
 
-        exchange_last_traded: dict[str, datetime] = {}
-        for exchange in cfg.universe.exchanges.keys():
+        exchange_last_traded: dict[tuple[str, str], datetime] = {}
+        for exchange, asset_class in combo_keys:
             last_traded = None
             reference = None
-            for candidate in _exchange_reference_candidates(cfg, universe, exchange):
+            for candidate in _exchange_reference_candidates(cfg, universe, exchange, asset_class):
                 reference = candidate
                 last_traded = _resolve_exchange_last_traded_date_from_candidate(
                     ibkr_client=ibkr_client,
@@ -427,47 +470,46 @@ def run_backfill(dry_run: bool | None = None) -> None:
                 if last_traded is not None:
                     break
             if last_traded is None:
-                logger.log("exchange_last_traded_unresolved", exchange=exchange)
-                unresolved_exchanges.append(exchange)
+                logger.log("exchange_last_traded_unresolved", exchange=exchange, asset_class=asset_class)
+                unresolved_combos.append(f"{exchange}/{asset_class}")
                 continue
-            exchange_last_traded[exchange] = last_traded
-            if not is_dry_run:
-                meta.upsert_exchange_last_traded_date(
-                    exchange=exchange,
-                    frequency=cfg.frequency.name,
-                    last_traded_ts=last_traded,
-                )
+            exchange_last_traded[(exchange, asset_class)] = last_traded
             logger.log(
                 "exchange_last_traded",
                 exchange=exchange,
+                asset_class=asset_class,
                 last_traded_date=last_traded.date().isoformat(),
                 reference_symbol=reference.symbol if reference else None,
                 reference_asset_class=reference.asset_class if reference else None,
             )
 
-        if unresolved_exchanges and cfg.fail_on_unresolved_exchange_last_traded:
+        if unresolved_combos and cfg.fail_on_unresolved_exchange_last_traded:
             error_message = (
-                "Unable to resolve exchange last traded date for exchanges: "
-                + ", ".join(sorted(unresolved_exchanges))
+                "Unable to resolve exchange last traded date for combos: "
+                + ", ".join(sorted(unresolved_combos))
             )
             logger.log(
                 "job_guard_failed",
                 reason="exchange_last_traded_unresolved",
-                exchanges=sorted(unresolved_exchanges),
+                combos=sorted(unresolved_combos),
                 fail_on_unresolved_exchange_last_traded=True,
             )
             if not is_dry_run:
-                for exchange in unresolved_exchanges:
+                for combo in unresolved_combos:
+                    combo_exchange, combo_asset = combo.split("/", 1)
                     meta.append_job_error(
                         run_id=run_id,
                         scope="exchange_last_traded",
-                        exchange=exchange,
+                        exchange=combo_exchange,
+                        symbol=None,
+                        year=None,
                         error_message=error_message,
                     )
             raise RuntimeError(error_message)
 
         for instrument in universe.instruments:
-            exchange_trade_date = exchange_last_traded.get(instrument.exchange)
+            combo_key = (instrument.exchange, instrument.asset_class)
+            exchange_trade_date = exchange_last_traded.get(combo_key)
             if exchange_trade_date is not None and not is_dry_run:
                 sync_state = meta.get_symbol_sync_status(
                     symbol=instrument.symbol,
@@ -557,6 +599,30 @@ def run_backfill(dry_run: bool | None = None) -> None:
                     earliest_ts=earliest_ts,
                     latest_ts=latest_ts,
                     last_traded_ts=last_traded,
+                )
+
+        if not is_dry_run:
+            for exchange, asset_class in combo_keys:
+                combo_sync_ts = meta.get_combo_parquet_sync_ts(
+                    exchange=exchange,
+                    frequency=cfg.frequency.name,
+                    asset_class=asset_class,
+                )
+                if combo_sync_ts is None:
+                    continue
+                combo_sync_ts = _normalize_trading_date(combo_sync_ts)
+                meta.upsert_exchange_last_traded_date(
+                    exchange=exchange,
+                    frequency=cfg.frequency.name,
+                    asset_class=asset_class,
+                    last_traded_ts=combo_sync_ts,
+                )
+                logger.log(
+                    "exchange_combo_parquet_sync_updated",
+                    exchange=exchange,
+                    asset_class=asset_class,
+                    frequency=cfg.frequency.name,
+                    last_traded_date=combo_sync_ts.date().isoformat(),
                 )
 
         if not is_dry_run:

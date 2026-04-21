@@ -18,8 +18,10 @@ def _cfg(mode: str):
     return SimpleNamespace(
         job_name=f"{mode}_job",
         mode=mode,
+        fail_on_unresolved_exchange_last_traded=False,
         storage=SimpleNamespace(duckdb_path="data/duckdb/test.duckdb", parquet_root="data/parquet/price-data"),
         frequency=SimpleNamespace(name="daily", ibkr_bar_size="1 day"),
+        postgres=SimpleNamespace(enabled=False, hot_window_months=6),
         ibkr=SimpleNamespace(
             what_to_show="TRADES",
             use_regular_trading_hours=True,
@@ -28,6 +30,17 @@ def _cfg(mode: str):
             gateway_mode="paper",
         ),
         rate_limits=SimpleNamespace(),
+        universe=SimpleNamespace(
+            exchanges={
+                "NASDAQ": SimpleNamespace(
+                    reference_symbol="AAPL",
+                    priority_symbols=["AAPL"],
+                    symbols=["AAPL"],
+                    priority_indices=[],
+                    indices=[],
+                )
+            }
+        ),
     )
 
 
@@ -57,6 +70,29 @@ class _MetaStub:
     def upsert_coverage(self, **kwargs) -> None:
         _ = kwargs
         self.coverage_updates += 1
+
+    def get_symbol_sync_status(self, **kwargs):
+        _ = kwargs
+        return None
+
+    def get_coverage(self, **kwargs):
+        _ = kwargs
+        return {
+            "min_ts": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "max_ts": datetime(2025, 1, 2, tzinfo=timezone.utc),
+            "row_count": 1,
+            "updated_at": datetime.now(timezone.utc),
+        }
+
+    def upsert_symbol_sync_status(self, **kwargs) -> None:
+        _ = kwargs
+
+    def get_combo_parquet_sync_ts(self, **kwargs):
+        _ = kwargs
+        return datetime(2025, 1, 2, tzinfo=timezone.utc)
+
+    def upsert_exchange_last_traded_date(self, **kwargs) -> None:
+        _ = kwargs
 
 
 class _IbkrStub:

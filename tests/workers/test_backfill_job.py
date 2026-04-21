@@ -95,6 +95,9 @@ class _StubMetaStore:
     def upsert_coverage(self, **kwargs) -> None:
         _ = kwargs
 
+    def upsert_parquet_symbol(self, **kwargs) -> None:
+        _ = kwargs
+
 
 def test_process_year_window_writes_and_marks_complete(tmp_path: Path) -> None:
     _ = tmp_path

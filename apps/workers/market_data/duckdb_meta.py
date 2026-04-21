@@ -92,12 +92,42 @@ class DuckDbMetaStore:
                 CREATE TABLE IF NOT EXISTS exchange_trading_dates (
                     exchange TEXT NOT NULL,
                     frequency TEXT NOT NULL,
+                    asset_class TEXT NOT NULL,
                     last_traded_ts TIMESTAMPTZ NOT NULL,
                     checked_at TIMESTAMPTZ NOT NULL,
-                    PRIMARY KEY (exchange, frequency)
+                    PRIMARY KEY (exchange, frequency, asset_class)
                 );
                 """
             )
+            # Migrate legacy schema (exchange, frequency) -> combo schema
+            # without dropping user data.
+            exchange_date_cols = {
+                str(row[1]).lower()
+                for row in conn.execute("PRAGMA table_info('exchange_trading_dates');").fetchall()
+            }
+            if "asset_class" not in exchange_date_cols:
+                conn.execute("ALTER TABLE exchange_trading_dates RENAME TO exchange_trading_dates_legacy;")
+                conn.execute(
+                    """
+                    CREATE TABLE exchange_trading_dates (
+                        exchange TEXT NOT NULL,
+                        frequency TEXT NOT NULL,
+                        asset_class TEXT NOT NULL,
+                        last_traded_ts TIMESTAMPTZ NOT NULL,
+                        checked_at TIMESTAMPTZ NOT NULL,
+                        PRIMARY KEY (exchange, frequency, asset_class)
+                    );
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO exchange_trading_dates (
+                        exchange, frequency, asset_class, last_traded_ts, checked_at
+                    )
+                    SELECT exchange, frequency, 'equity', last_traded_ts, checked_at
+                    FROM exchange_trading_dates_legacy;
+                    """
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS symbol_sync_status (
@@ -420,6 +450,7 @@ class DuckDbMetaStore:
         self,
         exchange: str,
         frequency: str,
+        asset_class: str,
         last_traded_ts: datetime,
     ) -> None:
         now = datetime.now(timezone.utc)
@@ -429,15 +460,15 @@ class DuckDbMetaStore:
             conn.execute(
                 """
                 INSERT INTO exchange_trading_dates (
-                    exchange, frequency, last_traded_ts, checked_at
+                    exchange, frequency, asset_class, last_traded_ts, checked_at
                 )
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(exchange, frequency)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(exchange, frequency, asset_class)
                 DO UPDATE SET
                     last_traded_ts = EXCLUDED.last_traded_ts,
                     checked_at = EXCLUDED.checked_at;
                 """,
-                [exchange, frequency, last_traded_ts, now],
+                [exchange, frequency, asset_class, last_traded_ts, now],
             )
         finally:
             conn.close()
@@ -446,27 +477,71 @@ class DuckDbMetaStore:
         self,
         exchange: str,
         frequency: str,
+        asset_class: str,
     ) -> dict[str, Any] | None:
         conn = self._connect()
         try:
             row = conn.execute(
                 """
-                SELECT exchange, frequency, last_traded_ts, checked_at
+                SELECT exchange, frequency, asset_class, last_traded_ts, checked_at
                 FROM exchange_trading_dates
-                WHERE exchange = ? AND frequency = ?;
+                WHERE exchange = ? AND frequency = ? AND asset_class = ?;
                 """,
-                [exchange, frequency],
+                [exchange, frequency, asset_class],
             ).fetchone()
             if not row:
                 return None
             return {
                 "exchange": row[0],
                 "frequency": row[1],
-                "last_traded_ts": row[2],
-                "checked_at": row[3],
+                "asset_class": row[2],
+                "last_traded_ts": row[3],
+                "checked_at": row[4],
             }
         finally:
             conn.close()
+
+    def get_combo_parquet_sync_ts(
+        self,
+        exchange: str,
+        frequency: str,
+        asset_class: str,
+    ) -> datetime | None:
+        """Return the latest common parquet sync date across all symbols in a combo.
+
+        The value is MIN(max_ts) across all symbols present in parquet_symbols
+        for the combo. If any symbol lacks coverage.max_ts, returns None.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS symbol_count,
+                    COUNT(c.max_ts) AS covered_count,
+                    MIN(c.max_ts) AS combo_sync_ts
+                FROM parquet_symbols p
+                LEFT JOIN data_coverage c
+                    ON c.symbol = p.symbol
+                   AND c.exchange = p.exchange
+                   AND c.asset_class = p.asset_class
+                   AND c.frequency = p.frequency
+                WHERE p.exchange = ?
+                  AND p.frequency = ?
+                  AND p.asset_class = ?;
+                """,
+                [exchange, frequency, asset_class],
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if not row:
+            return None
+
+        symbol_count, covered_count, combo_sync_ts = row
+        if symbol_count == 0 or covered_count < symbol_count or combo_sync_ts is None:
+            return None
+        return combo_sync_ts
 
     def upsert_symbol_sync_status(
         self,

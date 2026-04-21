@@ -189,6 +189,10 @@ backoff. Targets ~65% of IBKR's 60-requests-per-10-min limit.
 **Restartability:** `get_slice_state()` detects COMPLETE slices and skips them. Partial slices
 resume from `earliest_downloaded_ts`.
 
+**Combo sync watermark:** backfill updates `exchange_trading_dates` at
+`(exchange, frequency, asset_class)` level with the latest common parquet-sync
+date (`last_traded_ts`) after processing symbols.
+
 ---
 
 ## 3. Data Ingestion Flow — Daily Incremental
@@ -242,6 +246,12 @@ run_archive()
           DELETE … WHERE asset_class=? AND … AND timestamp < cutoff
           (only runs AFTER successful Parquet write)
 ```
+
+After each successful partition archive, the job also updates DuckDB metadata:
+- `meta.upsert_parquet_symbol(...)` for every symbol written to Parquet.
+- `meta.upsert_coverage(...)` with archived min/max timestamps per symbol.
+- `meta.upsert_exchange_last_traded_date(...)` for `(exchange, frequency, asset_class)`
+  based on the latest common parquet-sync watermark.
 
 **Safety invariant:** write → delete ordering. Duplicate Parquet rows from a partial run
 are harmless — `BarReader` deduplicates on `(symbol, exchange, asset_class, frequency, timestamp)`.
@@ -1310,7 +1320,7 @@ corporate_events                                   ← added Phase 3
 |---|---|
 | `backfill.py` | Full historical backfill; year-by-year, page-by-page; restartable |
 | `daily_refresh.py` | Incremental update: latest stored timestamp → now |
-| `archive_cold_bars.py` | Drains aged Postgres rows into Parquet; write-then-delete ordering |
+| `archive_cold_bars.py` | Drains aged Postgres rows into Parquet; write-then-delete ordering; updates DuckDB parquet/coverage metadata |
 | `fetch_events.py` | yfinance → `market_data.corporate_events`; dividends, splits, earnings |
 | `precompute_metrics.py` | Nightly rolling metrics (1Y/2Y/3Y/5Y) → `market_data.rolling_metrics` |
 | `arq_worker.py` | ARQ worker entry point; `fetch_bars_task`, `precompute_metrics_task`, `daily_refresh_task`; cron schedule |
