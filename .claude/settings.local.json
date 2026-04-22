@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile apps/workers/market_data/ibkr_client.py)"
+    ]
+  }
+}

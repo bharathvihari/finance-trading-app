@@ -12,6 +12,7 @@ and how the major flows are implemented end-to-end. Updated after each implement
 3. [Data Ingestion Flow — Daily Incremental](#3-data-ingestion-flow--daily-incremental)
 4. [Cold Archival Flow](#4-cold-archival-flow)
 5. [API Request Lifecycle](#5-api-request-lifecycle)
+5.5. [IBKR Request-Level Logging](#55-ibkr-request-level-logging-debug)
 6. [Bar Data Tiered Query Flow](#6-bar-data-tiered-query-flow)
 7. [Auth Flow](#7-auth-flow)
 8. [Dashboard & Widget CRUD Flow *(Phase 2)*](#8-dashboard--widget-crud-flow)
@@ -291,6 +292,116 @@ FastAPI matches route → handler function
 
 No DB query fires unless the JWT is valid. `user_id` from the token scopes every query —
 no cross-user data leakage is possible (ADR-010).
+
+---
+
+## 5.5. IBKR Request-Level Logging (DEBUG)
+
+The IBKR client logs every API request and response at DEBUG level (via Python `logging`).
+This is separate from the StructuredLogger used by backfill jobs and enables detailed debugging
+of individual IBKR API calls.
+
+### HTTP Request Logging (ibkr_client.py::_request_json)
+
+```
+DEBUG: IBKR request: method=GET, path=/v1/api/iserver/marketdata/history,
+       params={'conid': '265598', 'period': '1y', 'bar': '1d', 'outsideRth': 'false', 'startTime': '20260101-00:00:00'},
+       payload=None
+```
+
+Every HTTP call includes:
+- HTTP method (GET/POST)
+- Endpoint path
+- Query parameters
+- JSON payload (for POST requests)
+
+### Contract Resolution Logging (_resolve_conid)
+
+**Cache hit:**
+```
+DEBUG: Resolved conid from cache: symbol=AAPL, exchange=NASDAQ, asset_class=equity, conid=265598
+```
+
+**Fresh lookup (exchange match found):**
+```
+DEBUG: Resolving conid: symbol=AAPL, exchange=NASDAQ, asset_class=equity
+DEBUG: Resolved conid (exchange match): symbol=AAPL, exchange=NASDAQ, asset_class=equity, conid=265598
+```
+
+**Fresh lookup (fallback match):**
+```
+DEBUG: Resolving conid: symbol=TEST, exchange=UNKNOWN, asset_class=equity
+DEBUG: Resolved conid (fallback): symbol=TEST, exchange=UNKNOWN, asset_class=equity, conid=123456
+```
+
+### History Fetch Logging (_fetch_history)
+
+**Request:**
+```
+DEBUG: Fetching history: conid=265598, period=1y, bar_size=1 day,
+       use_rth=True, end_utc=2026-04-22T00:00:00+00:00
+```
+
+**Response:**
+```
+DEBUG: History fetch success: conid=265598, period=1y, rows_returned=252
+```
+
+### Head Timestamp Discovery Logging (paginated)
+
+```
+DEBUG: Head timestamp page fetch: symbol=AAPL, exchange=NASDAQ, page=1,
+       cursor=2026-04-22T00:00:00+00:00
+DEBUG: History fetch success: conid=265598, period=5y, rows_returned=1260
+DEBUG: Head timestamp page result: symbol=AAPL, exchange=NASDAQ, page=1,
+       chunk_oldest=2021-04-22T00:00:00+00:00, oldest=2021-04-22T00:00:00+00:00
+DEBUG: Head timestamp page empty: symbol=AAPL, exchange=NASDAQ, page=2
+```
+
+### High-Level Bar Request Logging (IbkrHistoricalClient)
+
+**Request:**
+```
+DEBUG: Fetch bars request: symbol=AAPL, exchange=NASDAQ, asset_class=equity,
+       frequency=daily, bar_size=1 day, what_to_show=TRADES,
+       use_rth=True, start_utc=2024-01-01T00:00:00+00:00,
+       end_utc=2024-12-31T23:59:59+00:00
+```
+
+**Response:**
+```
+DEBUG: Fetch bars response: symbol=AAPL, exchange=NASDAQ, rows_normalized=252
+```
+
+### Market Snapshot Logging (NEW)
+
+**Request:**
+```
+DEBUG: Fetch market snapshot request: instruments=AAPL@NASDAQ, MSFT@NASDAQ, count=2
+```
+
+**Response:**
+```
+DEBUG: Market snapshot fetch success: conids=265598,272093, rows_returned=2
+DEBUG: Fetch market snapshot response: instruments=AAPL@NASDAQ, MSFT@NASDAQ, rows_returned=2
+```
+
+### Enabling Request Logs
+
+To see DEBUG logs:
+
+```bash
+# Via environment variable
+export LOGLEVEL=DEBUG
+python -m jobs.backfill
+
+# Or in Python code
+import logging
+logging.basicConfig(level=logging.DEBUG)
+```
+
+Logs will be printed to stderr. For production, configure your logging handler
+(e.g., log to file, send to Sentry, etc.).
 
 ---
 
@@ -1305,14 +1416,14 @@ corporate_events                                   ← added Phase 3
 | Module | What it does |
 |---|---|
 | `config.py` | Pydantic config models: `JobConfig`, `PostgresConfig`, `IbkrConfig`, etc. |
-| `ibkr_client.py` | NautilusTrader wrapper; `fetch_bars()`, `get_head_timestamp()`, rate limiter |
+| `ibkr_client.py` | NautilusTrader wrapper; `fetch_bars()`, `get_head_timestamp()`, `fetch_market_snapshot()`; rate limiter; DEBUG-level request logging for all IBKR API calls |
 | `parquet_store.py` | `write_partition()` hive-partitioned writes; `read_bars()` DuckDB reads |
 | `postgres_store.py` | `upsert_bars()`, `read_bars_for_partition()`, `delete_bars_for_partition()`, `fetch_cold_partition_keys()`, `latest_timestamp()` |
 | `duckdb_meta.py` | Job runs, slice progress, coverage, split-check metadata |
 | `windowing.py` | `yearly_windows_newest_to_oldest()`, `paginated_windows_backward()` |
 | `dedup.py` | `deduplicate_bars()` — removes timestamp duplicates within a page |
 | `universe_loader.py` | Reads exchange/symbol lists from config; returns priority-ordered instruments |
-| `logger.py` | `StructuredLogger` — one JSON line per event, flushed after every write |
+| `logger.py` | `StructuredLogger` — one JSON line per event, flushed after every write (job-level events) |
 
 ### `apps/workers/jobs/`
 

@@ -230,6 +230,27 @@ F. CONFIGURATION & EXTENSIBILITY
      - Start/finish events for each ticker/year.  
      - Rate-limiting events and backoff.  
      - Errors and validation failures.  
+   - Request-level logging (at DEBUG level via Python `logging`):  
+     - **HTTP request logs** in `NautilusIbkrBackend._request_json()`:  
+       - Method (GET/POST), endpoint path, query params, JSON payload  
+       - Captures every call to IBKR Client Portal Gateway  
+     - **Contract resolution logs** in `_resolve_conid()`:  
+       - Symbol, exchange, asset_class  
+       - Cache hits vs. fresh lookups  
+       - Resolved conid values  
+     - **History fetch logs** in `_fetch_history()`:  
+       - conid, period (e.g., "1y"), bar_size, RTH flag, end timestamp  
+       - Response row count  
+     - **Head timestamp discovery logs** in `NautilusIbkrBackend.get_head_timestamp()`:  
+       - Page number, cursor timestamp  
+       - Oldest timestamp found per page  
+       - Progress across paginated requests  
+     - **High-level bar request logs** in `IbkrHistoricalClient.fetch_bars()`:  
+       - Full request parameters: symbol, exchange, asset_class, frequency, bar_size, what_to_show, use_rth, date range  
+       - Normalized row count in response  
+     - **Market snapshot logs** in `IbkrHistoricalClient.fetch_market_snapshot()`:  
+       - List of conids, instrument count  
+       - Row count returned  
    - Optional: Generate a small report (e.g., JSON/HTML/CSV) summarizing:  
      - Coverage per symbol.  
      - Last updated time.  

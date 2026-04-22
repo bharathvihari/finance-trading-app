@@ -67,6 +67,9 @@ class HistoricalBackend(Protocol):
     def fetch_historical(self, request: HistoricalRequest) -> list[dict[str, Any]]:
         ...
 
+    def fetch_market_snapshot(self, conids: list[str]) -> list[dict[str, Any]]:
+        ...
+
 
 class NautilusIbkrBackend:
     """IBKR Client Portal backend with Nautilus runtime validation.
@@ -165,7 +168,21 @@ class NautilusIbkrBackend:
         key = (instrument.symbol, instrument.exchange, instrument.asset_class)
         cached = self._conid_cache.get(key)
         if cached:
+            self.logger.debug(
+                "Resolved conid from cache: symbol=%s, exchange=%s, asset_class=%s, conid=%s",
+                instrument.symbol,
+                instrument.exchange,
+                instrument.asset_class,
+                cached,
+            )
             return cached
+
+        self.logger.debug(
+            "Resolving conid: symbol=%s, exchange=%s, asset_class=%s",
+            instrument.symbol,
+            instrument.exchange,
+            instrument.asset_class,
+        )
 
         contract = self._resolve_contract(instrument)
         payload = {
@@ -198,6 +215,13 @@ class NautilusIbkrBackend:
 
             conid_str = str(conid)
             self._conid_cache[key] = conid_str
+            self.logger.debug(
+                "Resolved conid (exchange match): symbol=%s, exchange=%s, asset_class=%s, conid=%s",
+                instrument.symbol,
+                instrument.exchange,
+                instrument.asset_class,
+                conid_str,
+            )
             return conid_str
 
         # Fallback to first valid result if exact exchange match was not returned.
@@ -205,6 +229,13 @@ class NautilusIbkrBackend:
             if isinstance(candidate, dict) and candidate.get("conid") not in (None, ""):
                 conid_str = str(candidate["conid"])
                 self._conid_cache[key] = conid_str
+                self.logger.debug(
+                    "Resolved conid (fallback): symbol=%s, exchange=%s, asset_class=%s, conid=%s",
+                    instrument.symbol,
+                    instrument.exchange,
+                    instrument.asset_class,
+                    conid_str,
+                )
                 return conid_str
 
         raise IbkrUpstreamError(
@@ -241,6 +272,15 @@ class NautilusIbkrBackend:
         if end_utc is not None:
             params["startTime"] = end_utc.strftime("%Y%m%d-%H:%M:%S")
 
+        self.logger.debug(
+            "Fetching history: conid=%s, period=%s, bar_size=%s, use_rth=%s, end_utc=%s",
+            conid,
+            period,
+            bar_size,
+            use_regular_trading_hours,
+            end_utc.isoformat() if end_utc else None,
+        )
+
         payload = self._request_json("GET", "/v1/api/iserver/marketdata/history", params=params)
         if not isinstance(payload, dict):
             raise IbkrUpstreamError("History response must be a JSON object.")
@@ -253,6 +293,13 @@ class NautilusIbkrBackend:
             return []
         if not isinstance(rows, list):
             raise IbkrUpstreamError("History response field 'data' must be a list.")
+
+        self.logger.debug(
+            "History fetch success: conid=%s, period=%s, rows_returned=%d",
+            conid,
+            period,
+            len(rows),
+        )
         return rows
 
     def _extract_timestamp(self, row: dict[str, Any]) -> datetime:
@@ -287,6 +334,14 @@ class NautilusIbkrBackend:
             body = json.dumps(json_payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
 
+        self.logger.debug(
+            "IBKR request: method=%s, path=%s, params=%s, payload=%s",
+            method.upper(),
+            path,
+            params,
+            json_payload,
+        )
+
         req = request.Request(endpoint, method=method.upper(), headers=headers, data=body)
 
         try:
@@ -313,7 +368,14 @@ class NautilusIbkrBackend:
         cursor = datetime.now(timezone.utc)
         oldest: datetime | None = None
 
-        for _ in range(self._MAX_HEAD_PAGES):
+        for page_num in range(self._MAX_HEAD_PAGES):
+            self.logger.debug(
+                "Head timestamp page fetch: symbol=%s, exchange=%s, page=%d, cursor=%s",
+                instrument.symbol,
+                instrument.exchange,
+                page_num + 1,
+                cursor.isoformat(),
+            )
             rows = self._fetch_history(
                 conid=conid,
                 period=self._HEAD_PAGE_PERIOD,
@@ -322,6 +384,12 @@ class NautilusIbkrBackend:
                 end_utc=cursor,
             )
             if not rows:
+                self.logger.debug(
+                    "Head timestamp page empty: symbol=%s, exchange=%s, page=%d",
+                    instrument.symbol,
+                    instrument.exchange,
+                    page_num + 1,
+                )
                 break
 
             timestamps = [self._extract_timestamp(row) for row in rows if isinstance(row, dict)]
@@ -329,6 +397,15 @@ class NautilusIbkrBackend:
                 break
             chunk_oldest = min(timestamps)
             oldest = chunk_oldest if oldest is None else min(oldest, chunk_oldest)
+
+            self.logger.debug(
+                "Head timestamp page result: symbol=%s, exchange=%s, page=%d, chunk_oldest=%s, oldest=%s",
+                instrument.symbol,
+                instrument.exchange,
+                page_num + 1,
+                chunk_oldest.isoformat(),
+                oldest.isoformat() if oldest else None,
+            )
 
             next_cursor = chunk_oldest - timedelta(days=1)
             if next_cursor >= cursor:
@@ -366,6 +443,38 @@ class NautilusIbkrBackend:
                 }
             )
         return filtered
+
+    def fetch_market_snapshot(self, conids: list[str]) -> list[dict[str, Any]]:
+        if not conids:
+            return []
+
+        conids_str = ",".join(conids)
+        self.logger.debug(
+            "Fetching market snapshot: conids=%s, count=%d",
+            conids_str,
+            len(conids),
+        )
+
+        params: dict[str, str] = {"conids": conids_str}
+        payload = self._request_json("GET", "/v1/api/iserver/marketdata/snapshot", params=params)
+        if not isinstance(payload, dict):
+            raise IbkrUpstreamError("Market snapshot response must be a JSON object.")
+
+        if payload.get("error"):
+            raise IbkrUpstreamError(f"IBKR market snapshot error: {payload['error']}")
+
+        rows = payload.get("data", [])
+        if rows is None:
+            return []
+        if not isinstance(rows, list):
+            raise IbkrUpstreamError("Market snapshot response field 'data' must be a list.")
+
+        self.logger.debug(
+            "Market snapshot fetch success: conids=%s, rows_returned=%d",
+            conids_str,
+            len(rows),
+        )
+        return rows
 
 
 class IbkrHistoricalClient:
@@ -469,19 +578,50 @@ class IbkrHistoricalClient:
         )
 
     def get_head_timestamp(self, instrument: Instrument) -> datetime | None:
+        self.logger.debug(
+            "Get head timestamp request: symbol=%s, exchange=%s, asset_class=%s",
+            instrument.symbol,
+            instrument.exchange,
+            instrument.asset_class,
+        )
         self._pacer.pace(self._head_request_key(instrument))
         head = self._backoff.run(
             lambda: self._backend.get_head_timestamp(instrument),
             self._is_retryable_error,
         )
         if head is None:
+            self.logger.debug(
+                "Get head timestamp response: symbol=%s, exchange=%s, head=None",
+                instrument.symbol,
+                instrument.exchange,
+            )
             return None
         if not isinstance(head, datetime):
             raise IbkrUpstreamError("Head timestamp from backend is not a datetime.")
-        return to_utc(head)
+        head_utc = to_utc(head)
+        self.logger.debug(
+            "Get head timestamp response: symbol=%s, exchange=%s, head=%s",
+            instrument.symbol,
+            instrument.exchange,
+            head_utc.isoformat(),
+        )
+        return head_utc
 
     def fetch_bars(self, request: HistoricalRequest) -> list[dict]:
         validated = self._validate_request(request)
+        self.logger.debug(
+            "Fetch bars request: symbol=%s, exchange=%s, asset_class=%s, frequency=%s, bar_size=%s, "
+            "what_to_show=%s, use_rth=%s, start_utc=%s, end_utc=%s",
+            validated.instrument.symbol,
+            validated.instrument.exchange,
+            validated.instrument.asset_class,
+            validated.frequency,
+            validated.bar_size,
+            validated.what_to_show,
+            validated.use_regular_trading_hours,
+            validated.start_utc.isoformat(),
+            validated.end_utc.isoformat(),
+        )
         self._pacer.pace(self._historical_request_key(validated))
         raw_rows = self._backoff.run(
             lambda: self._backend.fetch_historical(validated),
@@ -489,7 +629,14 @@ class IbkrHistoricalClient:
         )
         if not isinstance(raw_rows, list):
             raise IbkrUpstreamError("Historical response must be a list of dict rows.")
-        return self._normalize_rows(raw_rows, validated)
+        normalized = self._normalize_rows(raw_rows, validated)
+        self.logger.debug(
+            "Fetch bars response: symbol=%s, exchange=%s, rows_normalized=%d",
+            validated.instrument.symbol,
+            validated.instrument.exchange,
+            len(normalized),
+        )
+        return normalized
 
     def _is_retryable_error(self, exc: Exception) -> bool:
         return isinstance(exc, (IbkrConnectionError, IbkrUpstreamError, TimeoutError, OSError))
@@ -552,6 +699,48 @@ class IbkrHistoricalClient:
             return to_utc(parsed)
         raise IbkrUpstreamError(f"Unsupported timestamp type: {type(ts)}")
 
+    def fetch_market_snapshot(self, instruments: list[Instrument]) -> list[dict]:
+        if not instruments:
+            return []
+
+        symbols = ", ".join(f"{inst.symbol}@{inst.exchange}" for inst in instruments)
+        self.logger.debug(
+            "Fetch market snapshot request: instruments=%s, count=%d",
+            symbols,
+            len(instruments),
+        )
+
+        conids = []
+        for instrument in instruments:
+            try:
+                conid = self._backend._resolve_conid(instrument)
+                conids.append(conid)
+            except IbkrClientError as exc:
+                self.logger.warning(
+                    "Failed to resolve conid for snapshot: symbol=%s, exchange=%s, error=%s",
+                    instrument.symbol,
+                    instrument.exchange,
+                    str(exc),
+                )
+
+        if not conids:
+            return []
+
+        self._pacer.pace(f"snapshot:{','.join(conids)}")
+        raw_rows = self._backoff.run(
+            lambda: self._backend.fetch_market_snapshot(conids),
+            self._is_retryable_error,
+        )
+        if not isinstance(raw_rows, list):
+            raise IbkrUpstreamError("Market snapshot response must be a list of dict rows.")
+
+        self.logger.debug(
+            "Fetch market snapshot response: instruments=%s, rows_returned=%d",
+            symbols,
+            len(raw_rows),
+        )
+        return raw_rows
+
 
 class _FallbackBackend:
     def get_head_timestamp(self, instrument: Instrument) -> datetime | None:
@@ -560,4 +749,8 @@ class _FallbackBackend:
 
     def fetch_historical(self, request: HistoricalRequest) -> list[dict[str, Any]]:
         _ = request
+        return []
+
+    def fetch_market_snapshot(self, conids: list[str]) -> list[dict[str, Any]]:
+        _ = conids
         return []

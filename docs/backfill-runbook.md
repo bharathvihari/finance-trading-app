@@ -52,9 +52,33 @@ Dry-run behavior:
   - start line with UTC timestamp and `run_id`
   - gateway info line
   - dry-run banner when enabled
+  - Structured JSONL logs in `data/logs/{job_name}/{YYYY-MM-DD}.jsonl`
 - Validation:
   - summary printed
   - JSON/CSV report paths for non-dry runs
+
+## Debug Logging (Request-Level)
+
+To see detailed IBKR request/response logs (DEBUG level), set `LOGLEVEL`:
+
+```bash
+# Linux/macOS
+export LOGLEVEL=DEBUG
+python -m jobs.backfill
+
+# Windows PowerShell
+$env:LOGLEVEL = "DEBUG"
+python -m jobs.backfill
+```
+
+Debug logs show:
+- Every HTTP request (method, path, params, payload)
+- Contract resolution (symbol → conid mappings, cache hits)
+- History fetch calls (conid, period, bar size, row counts)
+- Head timestamp discovery pagination
+- Market snapshot requests with instrument lists
+
+Debug logs go to stderr. Combine with job JSONL logs in `data/logs/` for complete observability.
 
 ## Failure Recovery
 
